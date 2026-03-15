@@ -7,6 +7,8 @@
 #include <IRremote.hpp>
 #include <Preferences.h>
 
+#include "secrets.h"
+
 #define DECODE_NEC
 
 #define SCREEN_WIDTH      128
@@ -20,8 +22,9 @@
 #define UI_TICK_MS        50
 #define DISPLAY_REFRESH_MS  200
 
-const char* SSID       = "";
-const char* PASSWORD   = "";
+#define IDLE_SLEEP_MS 5000
+#define SLEEP_CHECK_US 800000
+
 const char* NTP_SERVER = "pool.ntp.org";
 
 Preferences prefs;
@@ -38,7 +41,6 @@ enum IRCommand : uint8_t {
   IR_CENTER = 0x1C
 };
 
-const unsigned int alarm_icon_length = 48;
 const unsigned char alarm_icon[] PROGMEM = {
 	0x07, 0xe0, 0x1f, 0xf8, 0x3f, 0xfc, 0x7e, 0x7e, 0x7e, 0x7e, 0xfe, 0x7f, 0xfe, 0x7f, 0xfe, 0x7f, 
 	0xff, 0x3f, 0xff, 0x9f, 0xff, 0xdf, 0x7f, 0xfe, 0x7f, 0xfe, 0x3f, 0xfc, 0x1f, 0xf8, 0x07, 0xe0
@@ -99,6 +101,42 @@ void displayClock(const char* timeStr, const char* alarmStr, const bool alarmEna
   display.display();
 }
 
+void tryToGetWorldTime(){
+  WiFi.begin(SSID, PASSWORD);
+
+  unsigned long wifiStart = millis();
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    if (millis() - wifiStart > WIFI_TIMEOUT_MS) {
+      Serial.println("WiFi timeout");
+      displayMessage("No WiFi");
+      break;
+    }
+
+    Serial.print(".");
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    configTzTime(
+      time_zone_location,
+      NTP_SERVER
+    );
+
+    Serial.println("\nWiFi connected");
+    delay(500);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) 
+      Serial.println(&timeinfo, "Time synced: %H:%M:%S");
+ 
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
 
 
 void saveAlarm() {
@@ -137,7 +175,7 @@ void IRTask(void* pvParameters) {
     }
     buttonWasPressed = buttonPressed;
 
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -147,13 +185,15 @@ void UITask(void* pvParameters) {
   unsigned long lastUpdate = 0;
   bool changingHours = true;
 
+  unsigned long lastActivity = millis();
+
   displayMessage("Ready");
 
   for (;;) {
-
     IRCommand cmd;
 
     if (xQueueReceive(eventQueue, &cmd, pdMS_TO_TICKS(UI_TICK_MS))) {
+      lastActivity = millis(); // reset idle timer
 
       switch (cmd) {
         
@@ -203,10 +243,22 @@ void UITask(void* pvParameters) {
 
     if (!getLocalTime(&timeinfo)) {
       displayMessage("No NTP", "check wifi");
+      delay(100);
+      tryToGetWorldTime();
       continue;
     }
 
     lastUpdate = now;
+    
+    if (!alarmClock.isRinging &&
+        now - lastActivity > IDLE_SLEEP_MS) {
+      esp_sleep_enable_timer_wakeup(SLEEP_CHECK_US);
+      esp_sleep_enable_gpio_wakeup();
+      gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+      gpio_wakeup_enable((gpio_num_t)IR_RECEIVE_PIN, GPIO_INTR_LOW_LEVEL);
+
+      esp_light_sleep_start();   // sleep here
+    }
    
     if (alarmClock.isRinging){
       static unsigned long lastToggle = 0;
@@ -257,10 +309,8 @@ void UITask(void* pvParameters) {
   }
 }
 
+
 void setup() {
-
-  Serial.begin(115200);
-
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -278,31 +328,7 @@ void setup() {
 
   displayMessage("Connecting", "WiFi...");
 
-  WiFi.begin(SSID, PASSWORD);
-
-  unsigned long wifiStart = millis();
-
-  while (WiFi.status() != WL_CONNECTED) {
-
-    if (millis() - wifiStart > WIFI_TIMEOUT_MS) {
-      Serial.println("WiFi timeout");
-      displayMessage("No WiFi");
-      break;
-    }
-
-    Serial.print(".");
-    vTaskDelay(pdMS_TO_TICKS(500));
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-
-    configTzTime(
-      "YourLocaltion",
-      NTP_SERVER
-    );
-
-    Serial.println("\nWiFi connected");
-  }
+  tryToGetWorldTime();
 
   eventQueue = xQueueCreate(QUEUE_LENGTH, sizeof(IRCommand));
 
